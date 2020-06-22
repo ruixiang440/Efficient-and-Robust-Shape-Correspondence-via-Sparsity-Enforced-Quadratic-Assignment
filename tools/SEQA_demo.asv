@@ -1,0 +1,198 @@
+%function SEQA_demo
+clc;
+close all;
+%clear;
+addpath(genpath('tools'));
+global M1 M2 S1 S2 mu sparsity good bad bw
+
+%% load data
+tic
+fname1 = 'Data/mesh000.off';
+fname2 = 'Data/mesh001.off';
+
+%% Generate nghd, stiffness and mass matrices
+[surf1.pt,surf1.trg] = ReadOFF(fname1);
+[surf1.aroundpt,surf1.aroundtrg] = GetAroundInf(surf1);
+[SS1,MM1] = Stiff(surf1.pt,surf1.trg);
+
+[surf2.pt,surf2.trg] = ReadOFF(fname2);
+[surf2.aroundpt,surf2.aroundtrg] = GetAroundInf(surf2);
+[SS2,MM2] = Stiff(surf2.pt,surf2.trg);
+
+%% Compute longest geodesic path on mesh
+option3.nb_iter_max = inf;
+s = randsample(num,1000);
+D3 = perform_fast_marching_mesh(surf2.pt, surf2.trg, s, option3);
+y = max(max(D3));
+
+%% Calculate SHOT
+MM2 = sparse(diag(sum(MM2,2)));
+mu = norm(SS2,'fro')^2/norm(MM2,'fro')^2; % mass coeff
+Area = sum(sum(MM2));
+Area = sqrt(Area);
+num = length(surf2.pt);
+opts.shot_num_bins = 10; % number of bins for shot
+opts.shot_radius = 5; % percentage of the diameter used for shot
+Xdesc = calc_shot(surf2.pt', surf2.trg', 1:num, opts.shot_num_bins, opts.shot_radius*Area/100, 3)';
+MM1 = sparse(diag(sum(MM1,2)));
+MA = diag(MM1);
+xdesc = calc_shot(surf1.pt', surf1.trg', 1:num, opts.shot_num_bins, opts.shot_radius*Area/100, 3)';
+pertF = knnsearch(Xdesc,xdesc);
+disp('Initial Guess Completed')
+
+clear xdesc Xdesc
+%% Calculate HeatKernels
+opts.n_evecs = 300;
+surf2.VERT = surf2.pt;
+surf2.TRIV = surf2.trg;
+[surf2.evecs,surf2.evals] = HeatKernels(surf2,1:num,opts.n_evecs);
+surf1.VERT = surf1.pt;
+surf1.TRIV = surf1.trg;
+[surf1.evecs,surf1.evals] = HeatKernels(surf1,1:num,opts.n_evecs);
+disp('HeatKernel Computation Comopleted')
+
+%% Algorithm Parameters
+ring_num = 4;
+steps = 50*ones(100,1);
+th = [5:-0.8:1];
+e = zeros(num,1);
+landmark = cell(20,1);
+goods = cell(20,1);
+bads = cell(20,1);
+
+%% Main 
+for kk=1:5
+    %% Local Distortion
+    D1 = cell(num,1);
+    D2 = cell(num,1);
+    idx = cell(num,1);
+    ee = 0;
+    eee = 0;
+    if kk==1
+        parfor i = 1:num
+            D1{i} = FastMarchingSR(i,surf1);
+            idx{i} = find(D1{i} ~= 0);
+            D1{i} = D1{i}(D1{i} ~= 0);
+            r = max(D1{i});
+            D2{i} = FastMarchingFindGeo(pertF(i),surf2,pertF(idx{i}),4);
+            e(i) = sum((((D1{i}-D2{i}).^2)/r).*MA(idx{i}))/sum(MA(idx{i}));
+        end
+    else
+        parfor i = 1:length(good)
+            D1{i} = FastMarchingSR(good(i),surf1);
+            idx{i} = find(D1{i} ~= 0);
+            D1{i} = D1{i}(D1{i} ~= 0);
+            r = max(D1{i});
+            D2{i} = FastMarchingFindGeo(pertF(good(i)),surf2,pertF(idx{i}),4);
+            ee(i) = sum((((D1{i}-D2{i}).^2)/r).*MA(idx{i}))/sum(MA(idx{i}));
+        end
+        e(good)=ee;
+    end
+    landmarks = find(e<th(kk));
+    landmark{kk} = landmarks;
+    %% Define Sparsity
+    cor = pertF(landmarks);
+    sparsity = cell(num,1);
+    target = [];
+    for i = 1:length(landmarks)
+        cur = findNring(landmarks(i),surf1,ring_num);
+        trg = findNring(cor(i),surf2,ring_num);
+        target = union(target,trg);
+        for j = 1:length(cur)
+            sparsity{cur(j)} = [sparsity{cur(j)};trg];
+        end
+    end
+    target = unique(target);
+    for i = 1:length(landmarks)
+        sparsity{landmarks(i)} = [cor(i)];
+    end
+    parfor i = 1:num
+        sparsity{i} = unique(sparsity{i});
+    end
+    ge = cellfun(@isempty,sparsity);
+    good = find(ge==0);
+    bad = find(ge==1);
+    sparsity=sparsity(~cellfun('isempty',sparsity));
+    map_FtC = zeros(num,1);
+    parfor i = 1:num
+        place = find(target == i);
+        if ~isempty(place)
+            map_FtC(i) = place;
+        end
+    end
+    parfor i = 1:length(sparsity)
+        sparsity{i} = map_FtC(sparsity{i});
+    end
+    goods{kk} = good;
+    WP = PerMatrix(pertF);
+    P = WP(good,target);
+    [m,n]=size(P);
+    [I,J]=deal(sparsity);
+    for k=1:length(sparsity)
+        I{k}(:)=k;
+    end
+    I=cell2mat(I); J=cell2mat(J);
+    bw=sparse(I,J,true,m,n);
+    S1 = sparse(SS1(good,good));
+    S2 = sparse(SS2(target,target));
+    M1 = sparse(MM1(good,good));
+    M2 = sparse(MM2(target,target));
+    %% Optimiztaion
+    opt.record = 1;
+    P = sparse(P);
+    opt.maxit = steps(kk);  
+    [P, g, out] = fminPGBBgpu_nofull(P, @funNWRongjieGPU, @Proj_DoubleStochasticM_reloc,opt);
+    [~,sol] = sort(P','descend');
+    pertCF = sol(1,:)';
+    pertF(good) = target(pertCF);
+    pp(kk,:) = pertF;
+end
+%% Post Processing
+ee = 0;
+parfor i = 1:length(good)
+    D1{i} = FastMarchingSR(good(i),surf1);
+    idx{i} = find(D1{i} ~= 0);
+    D1{i} = D1{i}(D1{i} ~= 0);
+    r = max(D1{i});
+    D2{i} = FastMarchingFindGeo(pertF(good(i)),surf2,pertF(idx{i}),4);
+    ee(i) = sum((((D1{i}-D2{i}).^2)/r).*MA(idx{i}))/sum(MA(idx{i}));
+end
+e(good)=ee;
+landmarks = find(e<th(end));
+landmark{kk+1} = landmarks;
+num_land = length(landmarks);
+options.nb_iter_max = Inf;
+[~, minidx] = min(e);
+minidx = find(landmarks == minidx);
+fpslandmarks = fps_euclidean(surf1.pt(landmarks,:),num_land,minidx);
+
+t = 0.001;
+ex = zeros(num,num_land);
+ey = zeros(num,num_land);
+for i=1:num_land
+    ex(landmarks(fpslandmarks(i)),i) = 1;
+    ey(pertF(landmarks(fpslandmarks(i))),i) = 1;
+end
+Kx = ex'*surf1.evecs* diag(exp(-t*abs(surf1.evals))) * surf1.evecs';
+Ky = ey'*surf2.evecs* diag(exp(-t*abs(surf2.evals))) * surf2.evecs';
+leftX = setdiff(1:num,landmarks);
+leftY = setdiff(1:num,pertF(landmarks));
+Kx = Kx(:,leftX)';
+Ky = Ky(:,leftY)';
+map = knnsearch(Ky,Kx);
+pertF(leftX) = leftY(map);
+disp(['Finished, Time is' num2str(toc)]);
+%% Compute Geodesic Error
+D3T = D3(pertF,:);
+geoerror = zeros(1000,1);
+for i=1:length(s)
+    a=s(i);
+    dis1 = D3T(a,i);
+    geoerror(i)=dis1/y;
+end
+figure
+hold on
+cdfplot(geoerror)
+title('Geo error')
+ylabel('%Correspondence')
+xlim([0,1])
